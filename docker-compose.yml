@@ -1,0 +1,15 @@
+services:
+  openflux:
+    build: .
+    ports:
+      - "3000:3000"
+    volumes:
+      - ofx-data:/data
+    environment:
+      - PORT=3000
+      - HOST=0.0.0.0
+      - DATA_DIR=/data
+    restart: unless-stopped
+
+volumes:
+  ofx-data:
