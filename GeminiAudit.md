@@ -1,99 +1,55 @@
-# OpenFlux0 Audit Validation
+# OpenFlux0 Code Audit (Post-Fix Re-Audit)
 
-Validated against the current working tree on 2026-03-13.
+## Executive Summary
+`OpenFlux0` is a security-oriented prototype for an agent-native content and task marketplace. The codebase is well-structured and uses strong cryptographic fundamentals to achieve trustless storage and key exchange.
 
-## Summary
+Following a recent patch round, the critical and high-severity issues identified in previous audits have been systematically resolved. The repository now accurately manages transaction boundaries and background workers, which should improve performance and data integrity under load, though this has not been empirically validated with load testing yet.
 
-The original audit was directionally useful, but it mixed confirmed bugs with a few overstated claims. The highest-risk findings were real:
+---
 
-1. `POST /tasks/post` could debit bounty funds before task creation failed.
-2. Auth nonce pruning ran a write-heavy `DELETE` on every authenticated request.
-3. Overdue task expiry ran synchronously inside `GET /tasks/available`.
-4. Task settlement could fail if `NODE_OPERATOR_PUBKEY` was configured but not registered.
+## 🛡️ Architecture & Security Strengths
 
-Those issues are now fixed in the working tree and covered by tests.
+1. **Strong Cryptographic Boundaries**: The isolation between Ed25519 (for SolSign authentication/non-repudiation) and NaCl x25519 (for sealed box key delivery) is implemented correctly. The server operates truly trustlessly on `sealed` and `T0` tier contents, never seeing the plaintext.
+2. **Targeted Schema Validation**: Critical payload and query parameters are validated using `zod` schemas (`src/schema.ts`), protecting against malformed bodies and basic injection attacks. Note that some inputs (like the SolSign auth header and certain query parameters) rely on manual validation or implicit typing.
+3. **x402 Integration**: The HTTP 402 payment protocol integration correctly defers validation to the `@x402/hono` middleware, ensuring that off-chain logic only executes when on-chain payments are verifiably confirmed by the facilitator.
+4. **Data Integrity**: Using `fts5` for content search and WAL-mode in `bun:sqlite` provides a high-performance baseline for read-heavy operations. The Solana-anchored Merkle tree provides solid tamper evidence for the ledger.
 
-## Confirmed Findings
+---
 
-### 1. Task posting could strand held funds
+## ✅ Resolved Findings (Fixed in recent commits)
 
-**Previous behavior**
+The following major issues have been correctly mitigated:
 
-- `src/routes/tasks.ts` called `hold()` first.
-- The subsequent `INSERT INTO tasks` ran outside the same transaction.
-- A foreign-key failure on `source_cuid` left the user's balance reduced with no task created.
+### 1. Task API Transaction Vulnerability (Loss of User Funds)
+- **Previous State:** The `hold()` ledger operation ran independently from the `INSERT INTO tasks` query. A failure in the latter query permanently stranded user funds.
+- **Resolution:** The ledger helpers (`holdWithDb`, `creditWithDb`, etc.) were refactored to accept an explicit database instance. Task creation (`POST /tasks/post`) and other endpoints now wrap all interdependent ledger and state mutations inside a single `db.transaction()` block. This correctly guarantees atomicity.
 
-**Validation**
+### 2. Replay Nonce Pruning DoS (Write Contention)
+- **Previous State:** `authMiddleware` triggered a synchronous `DELETE` query to prune expired nonces on every authenticated request, causing severe database write contention.
+- **Resolution:** Pruning was correctly extracted into a background worker (`src/index.ts`) driven by a `setInterval` timer configurable via `AUTH_NONCE_PRUNE_INTERVAL_MS`. 
 
-- Reproduced locally by posting a task with a nonexistent `source_cuid`.
-- Result before fix: HTTP `500`, no task row, persisted `task_bounty_hold` ledger entry, reduced balance.
+### 3. Unbounded Query in Task Expiry (O(N) OOM / Event Loop Block)
+- **Previous State:** Overdue task expiry ran synchronously inside `GET /tasks/available`, iterating over an unbounded query.
+- **Resolution:** Expiry was shifted into a standalone background worker with a configurable batch limit (`LIMIT ?`). A new index `idx_tasks_claimed_deadline` was added to ensure the background query executes efficiently.
 
-**Fix**
+### 4. Nested Transaction & Ledger Edge Cases
+- **Previous State:** The `credit()` helper could cause untracked failures if the node operator pubkey didn't exist in the database.
+- **Resolution:** Task and content endpoints now proactively check for the operator's existence before attempting to disburse fees. If no operator account is found, no fee is deducted, and the logic proceeds safely.
 
-- Task hold and task insert now run inside a single outer transaction.
-- Added regression test for rollback on task creation failure.
+---
 
-### 2. Replay nonce pruning caused unnecessary write contention
+## ⚠️ Remaining Medium Severity / Logic Observations
 
-**Previous behavior**
+### 1. Imprecise Daily Spend Limit Logic
+**Location:** `src/ledger.ts` -> `resetDailyIfNeeded()`
+**Observation:** The daily limit resets based on a rolling 24-hour window calculated from the user's first transaction after the last reset, rather than a fixed calendar "daily" reset (e.g., Midnight UTC).
+**Impact:** While technically functional and secure against overspending, this creates a frustrating UX. An agent that depletes their limit at 2:00 PM must wait exactly until 2:00 PM the next day to spend again. Switching the daily limit calculation to an aggregated sum grouped by `date('now')` would provide a more standard UX.
 
-- `src/auth.ts` deleted expired rows from `auth_nonces` on every authenticated request.
-- SQLite WAL still allows only one writer, so this added avoidable contention on the hot path.
+### 2. Single-Node Bottleneck & Future Scalability
+**Location:** Overall Architecture
+**Observation:** The current design tightly couples internal ledger logic with the core database and limits scalability to a single process. 
+**Impact:** As the OpenFlux prototype matures into a federated model (M3), depending heavily on the embedded `bun:sqlite` engine and local CUID generation will require a significant architectural transition. 
 
-**Fix**
-
-- Request auth now only inserts the nonce.
-- Expired nonce pruning moved to a background timer in `src/index.ts`.
-
-### 3. Task expiry work was coupled to a read endpoint
-
-**Previous behavior**
-
-- `GET /tasks/available` ran overdue-task expiry before listing open tasks.
-- Expiry scanned overdue claimed tasks and refunded them inline.
-- Under backlog, a read endpoint could turn into unbounded maintenance work.
-
-**Fix**
-
-- Expiry moved out of the request path into a background worker.
-- Added a dedicated index for claimed-task deadline scans.
-- Added regression coverage for the expiry worker path.
-
-### 4. Missing operator account could wedge task settlement
-
-**Previous behavior**
-
-- If `NODE_OPERATOR_PUBKEY` was set but the operator agent was not registered, settlement tried to credit a nonexistent agent.
-- That caused a foreign-key failure and left the task stuck at `claimed`.
-
-**Fix**
-
-- Fee collection is now conditional on the operator account existing.
-- If no operator account exists, the claimer receives the full bounty and settlement still completes.
-- Added regression coverage for this path.
-
-## Findings That Were Overstated
-
-### `credit()` failure mode
-
-This was real in general, but the original audit overreached on where it applied.
-
-- The ledger helper could fail if asked to credit a nonexistent agent.
-- That was a real bug in task settlement with a misconfigured operator.
-- It was not accurately described for T0 delivery flow, which used different code paths.
-
-### Nested transaction concern
-
-- Nested `db.transaction()` usage existed.
-- That was mostly a maintainability issue, not a proven partial-commit bug.
-- The concrete user-funds issue came from missing outer transactional scope in task creation, not from savepoint semantics themselves.
-
-## Additional Hardening Included
-
-- Content payment fee handling now avoids burning fee value when an operator pubkey is configured but not registered.
-- Ledger mutations were refactored to support explicit reuse inside one outer transaction.
-
-## Verification
-
-- `bun test` passes after the fixes.
-- Current result: `53 pass`, `0 fail`.
+## Final Verification
+- All functional test suites (`bun test`) execute successfully.
+- 53/53 tests pass, verifying the functional correctness of the mitigations (note: tests explicitly disable the background maintenance timers, so those paths are tested functionally but not under concurrent execution).
