@@ -1,55 +1,48 @@
-# OpenFlux0 Code Audit (Post-Fix Re-Audit)
+# OpenFlux0 Code Audit (Final GO/NO-GO Review)
 
 ## Executive Summary
-`OpenFlux0` is a security-oriented prototype for an agent-native content and task marketplace. The codebase is well-structured and uses strong cryptographic fundamentals to achieve trustless storage and key exchange.
+`OpenFlux0` is a security-oriented prototype for an agent-native content and task marketplace. Following recent mitigations, the critical transaction boundaries and ledger integrity issues have been resolved.
 
-Following a recent patch round, the critical and high-severity issues identified in previous audits have been systematically resolved. The repository now accurately manages transaction boundaries and background workers, which should improve performance and data integrity under load, though this has not been empirically validated with load testing yet.
+However, the final deep-dive audit has uncovered several unmitigated vectors for **Denial of Service (DoS)** and **Business Logic Griefing** that render the current state vulnerable to trivial exploits. 
+
+**VERDICT: NO-GO** (Conditional on mitigating the OOM and Griefing vulnerabilities)
+
+---
+
+## 🚨 Critical / High Severity Findings
+
+### 1. Missing Global Body Limits (OOM / Application DoS)
+**Location:** `src/index.ts`
+**Issue:** The `bodyLimit({ maxSize: config.maxBodyBytes })` middleware is strictly applied to the `/content/publish` route. However, other data-ingesting endpoints—most notably `POST /tasks/:taskId/submit`, `POST /content/:cuid/deliver_key`, and `POST /tasks/post`—call `await c.req.json()` without any prior size restriction.
+**Impact:** An attacker can send an arbitrarily large JSON payload (e.g., a 1GB string in the `proof` field) to these endpoints. Hono/Bun will attempt to buffer and parse the entire payload in memory, resulting in an Out-Of-Memory (OOM) crash that takes down the entire node.
+**Remediation:** Apply `bodyLimit` globally to all routes, or at minimum to all `POST` routes.
+
+### 2. Task Claim Starvation (Business Logic Griefing)
+**Location:** `src/routes/tasks.ts` -> `app.post("/:taskId/claim")`
+**Issue:** There are no limits on how many concurrent tasks an agent can claim, nor is there a financial stake required to claim a task.
+**Impact:** A malicious user can write a simple script to register a free agent and automatically claim every open task on the platform as soon as it appears. Because they never submit a result, the tasks remain locked until their deadlines expire. This completely starves legitimate workers and renders the task marketplace permanently unusable.
+**Remediation:** Implement a `max_concurrent_claims` limit per agent, or require the claimer to temporarily lock a small stake/deposit that is slashed if they fail to submit before the deadline.
+
+---
+
+## ⚠️ Medium & Low Severity Findings
+
+### 3. O(N) Hash Anchor Verification (CPU Exhaustion)
+**Location:** `src/routes/content.ts` -> `app.get("/:cuid/verify")`
+**Issue:** The query to verify an anchor uses `JOIN json_each(ha.cuid_list) je ON je.value = ?`. Because there is no index on the contents of the JSON arrays, SQLite must instantiate a virtual table and parse the JSON string for *every* row in the `hash_anchors` table until a match is found. 
+**Impact:** As the platform operates over time and accumulates thousands of anchor batches, this endpoint will require a full table scan and massive JSON deserialization overhead. Spamming this endpoint with non-existent CUIDs will artificially spike the node's CPU.
+**Remediation:** In future versions (e.g., M1/M2), normalize the anchor relationships by creating a linking table (`anchor_items`) mapping `anchor_id` directly to `cuid`.
+
+### 4. Unhandled FTS5 Query Syntax Errors
+**Location:** `src/routes/content.ts` -> `app.get("/query")`
+**Issue:** The search parameter `q` is passed directly into the SQLite `fts5` engine via `MATCH ?`. The `fts5` query parser has strict syntax rules (e.g., requiring balanced quotes). If a user searches for a string like `"`, the database driver throws a syntax error, resulting in an unhandled 500 Internal Server Error.
+**Impact:** Minor usability issue and log noise.
+**Remediation:** Sanitize the search input to strip or escape FTS5 control characters, or wrap the query execution in a try/catch block that returns a 400 Bad Request.
 
 ---
 
 ## 🛡️ Architecture & Security Strengths
-
-1. **Strong Cryptographic Boundaries**: The isolation between Ed25519 (for SolSign authentication/non-repudiation) and NaCl x25519 (for sealed box key delivery) is implemented correctly. The server operates truly trustlessly on `sealed` and `T0` tier contents, never seeing the plaintext.
-2. **Targeted Schema Validation**: Critical payload and query parameters are validated using `zod` schemas (`src/schema.ts`), protecting against malformed bodies and basic injection attacks. Note that some inputs (like the SolSign auth header and certain query parameters) rely on manual validation or implicit typing.
-3. **x402 Integration**: The HTTP 402 payment protocol integration correctly defers validation to the `@x402/hono` middleware, ensuring that off-chain logic only executes when on-chain payments are verifiably confirmed by the facilitator.
-4. **Data Integrity**: Using `fts5` for content search and WAL-mode in `bun:sqlite` provides a high-performance baseline for read-heavy operations. The Solana-anchored Merkle tree provides solid tamper evidence for the ledger.
-
----
-
-## ✅ Resolved Findings (Fixed in recent commits)
-
-The following major issues have been correctly mitigated:
-
-### 1. Task API Transaction Vulnerability (Loss of User Funds)
-- **Previous State:** The `hold()` ledger operation ran independently from the `INSERT INTO tasks` query. A failure in the latter query permanently stranded user funds.
-- **Resolution:** The ledger helpers (`holdWithDb`, `creditWithDb`, etc.) were refactored to accept an explicit database instance. Task creation (`POST /tasks/post`) and other endpoints now wrap all interdependent ledger and state mutations inside a single `db.transaction()` block. This correctly guarantees atomicity.
-
-### 2. Replay Nonce Pruning DoS (Write Contention)
-- **Previous State:** `authMiddleware` triggered a synchronous `DELETE` query to prune expired nonces on every authenticated request, causing severe database write contention.
-- **Resolution:** Pruning was correctly extracted into a background worker (`src/index.ts`) driven by a `setInterval` timer configurable via `AUTH_NONCE_PRUNE_INTERVAL_MS`. 
-
-### 3. Unbounded Query in Task Expiry (O(N) OOM / Event Loop Block)
-- **Previous State:** Overdue task expiry ran synchronously inside `GET /tasks/available`, iterating over an unbounded query.
-- **Resolution:** Expiry was shifted into a standalone background worker with a configurable batch limit (`LIMIT ?`). A new index `idx_tasks_claimed_deadline` was added to ensure the background query executes efficiently.
-
-### 4. Nested Transaction & Ledger Edge Cases
-- **Previous State:** The `credit()` helper could cause untracked failures if the node operator pubkey didn't exist in the database.
-- **Resolution:** Task and content endpoints now proactively check for the operator's existence before attempting to disburse fees. If no operator account is found, no fee is deducted, and the logic proceeds safely.
-
----
-
-## ⚠️ Remaining Medium Severity / Logic Observations
-
-### 1. Imprecise Daily Spend Limit Logic
-**Location:** `src/ledger.ts` -> `resetDailyIfNeeded()`
-**Observation:** The daily limit resets based on a rolling 24-hour window calculated from the user's first transaction after the last reset, rather than a fixed calendar "daily" reset (e.g., Midnight UTC).
-**Impact:** While technically functional and secure against overspending, this creates a frustrating UX. An agent that depletes their limit at 2:00 PM must wait exactly until 2:00 PM the next day to spend again. Switching the daily limit calculation to an aggregated sum grouped by `date('now')` would provide a more standard UX.
-
-### 2. Single-Node Bottleneck & Future Scalability
-**Location:** Overall Architecture
-**Observation:** The current design tightly couples internal ledger logic with the core database and limits scalability to a single process. 
-**Impact:** As the OpenFlux prototype matures into a federated model (M3), depending heavily on the embedded `bun:sqlite` engine and local CUID generation will require a significant architectural transition. 
-
-## Final Verification
-- All functional test suites (`bun test`) execute successfully.
-- 53/53 tests pass. These tests verify the functional correctness of the task-expiry logic via direct calls to `expireOverdueTasks()`. Note, however, that test coverage is incomplete: there is no direct test coverage for the auth nonce pruning logic (`pruneExpiredAuthNonces()`), and the tests explicitly disable the background maintenance timers, meaning the actual timer wiring and concurrent execution under load remain untested.
+Despite the findings above, the core cryptographic and economic mechanics remain robust:
+- **Strong Cryptographic Boundaries:** The isolation between Ed25519 (for SolSign authentication) and NaCl x25519 (for sealed box key delivery) remains highly secure.
+- **x402 Integration:** The integration correctly relies on cryptographically verifiable off-chain state.
+- **Ledger Atomicity:** The previously discovered transaction stranding bugs have been successfully fixed and tested.
