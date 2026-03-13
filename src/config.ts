@@ -50,6 +50,9 @@ export const config = {
   get maxBodyBytes() {
     return Number(process.env.MAX_BODY_BYTES ?? 65536); // 64 KB
   },
+  get maxConcurrentTaskClaims() {
+    return Number(process.env.MAX_CONCURRENT_TASK_CLAIMS ?? 3);
+  },
 
   // x402 payment integration
   get x402Enabled() {

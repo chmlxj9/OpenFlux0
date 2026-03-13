@@ -138,10 +138,12 @@ export async function anchorHashes(): Promise<{
     .query(`
       SELECT c.cuid, c.body_hash
       FROM content c
-      WHERE c.cuid NOT IN (
-        SELECT json_each.value
-        FROM hash_anchors, json_each(hash_anchors.cuid_list)
-        WHERE COALESCE(hash_anchors.tx_signature, '') <> ''
+      WHERE NOT EXISTS (
+        SELECT 1
+        FROM anchor_items ai
+        JOIN hash_anchors ha ON ha.id = ai.anchor_id
+        WHERE ai.cuid = c.cuid
+          AND COALESCE(ha.tx_signature, '') <> ''
       )
       ORDER BY c.created_at ASC
       LIMIT 100
@@ -156,12 +158,18 @@ export async function anchorHashes(): Promise<{
   const hashes = rows.map((r) => r.body_hash);
   const merkleRoot = buildMerkleRoot(hashes);
 
-  // Insert anchor record (pre-tx)
-  const result = db
-    .query(
-      "INSERT INTO hash_anchors (merkle_root, cuid_list) VALUES (?, ?) RETURNING id"
-    )
-    .get(merkleRoot, JSON.stringify(cuids)) as { id: number };
+  // Insert anchor record and membership rows before attempting the Solana tx.
+  const result = db.transaction(() => {
+    const anchor = db
+      .query(
+        "INSERT INTO hash_anchors (merkle_root, cuid_list) VALUES (?, ?) RETURNING id"
+      )
+      .get(merkleRoot, JSON.stringify(cuids)) as { id: number };
+    for (const cuid of cuids) {
+      db.query("INSERT INTO anchor_items (anchor_id, cuid) VALUES (?, ?)").run(anchor.id, cuid);
+    }
+    return anchor;
+  })();
 
   // Send memo tx to Solana
   let txSignature = "";

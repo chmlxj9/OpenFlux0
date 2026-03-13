@@ -88,6 +88,17 @@ app.post("/:taskId/claim", (c) => {
   if (!task) return c.json({ error: "Task not found" }, 404);
   if (task.status !== "open") return c.json({ error: `Task is ${task.status}, not open` }, 409);
   if (task.poster_pubkey === pubkey) return c.json({ error: "Cannot claim your own task" }, 400);
+  if (config.maxConcurrentTaskClaims > 0) {
+    const activeClaims = db
+      .query("SELECT COUNT(*) as cnt FROM tasks WHERE claimer_pubkey = ? AND status = 'claimed'")
+      .get(pubkey) as { cnt: number };
+    if (activeClaims.cnt >= config.maxConcurrentTaskClaims) {
+      return c.json(
+        { error: `Concurrent claim limit reached (${config.maxConcurrentTaskClaims})` },
+        429
+      );
+    }
+  }
 
   const deadlineRow = db
     .query("SELECT deadline_seconds FROM tasks WHERE task_id = ?")

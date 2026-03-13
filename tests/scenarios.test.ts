@@ -267,6 +267,25 @@ describe("OpenFlux scenario validation", () => {
     expect(payload.error).toContain("Payload Too Large");
   });
 
+  it("returns 413 when /tasks/post payload exceeds max body size", async () => {
+    const alice = new Agent();
+
+    let res = await signedFetch(alice, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+
+    const oversizedInstruction = "x".repeat(70_000);
+    res = await signedFetch(alice, "POST", "/tasks/post", {
+      task_type: "execution",
+      instruction: oversizedInstruction,
+      bounty_lamports: 1,
+      deadline_seconds: 60,
+    });
+
+    expect(res.status).toBe(413);
+    const payload = await json(res);
+    expect(payload.error).toContain("Payload Too Large");
+  });
+
   it("rejects publish from unregistered agents", async () => {
     const alice = new Agent();
     const body = JSON.stringify({ signal: "AAPL bullish" });
@@ -785,6 +804,21 @@ describe("OpenFlux scenario validation", () => {
     expect(payload.anchor).toBeNull();
   });
 
+  it("returns 400 for invalid FTS5 syntax instead of 500", async () => {
+    const alice = new Agent();
+
+    let res = await signedFetch(alice, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+
+    res = await signedFetch(alice, "POST", "/content/publish", openPublishBody(alice, "fts target"));
+    expect(res.status).toBe(201);
+
+    res = await signedFetch(alice, "GET", "/content/query?q=%22");
+    expect(res.status).toBe(400);
+    const payload = await json(res);
+    expect(payload.error).toContain("Invalid full-text search query");
+  });
+
   // ── Rate limiting tests ──
 
   it("enforces per-user daily publish limit (rejects at 11th)", async () => {
@@ -1029,6 +1063,42 @@ describe("OpenFlux scenario validation", () => {
     // Charlie tries to claim the same task
     res = await signedFetch(charlie, "POST", `/tasks/${task_id}/claim`);
     expect(res.status).toBe(409);
+  });
+
+  it("limits the number of concurrently claimed tasks per agent", async () => {
+    const poster = new Agent();
+    const worker = new Agent();
+    process.env.MAX_CONCURRENT_TASK_CLAIMS = "2";
+
+    let res = await signedFetch(poster, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+    res = await signedFetch(worker, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+    res = await signedFetch(poster, "POST", "/agents/deposit", { amount: 500_000 });
+    expect(res.status).toBe(200);
+
+    const taskIds: string[] = [];
+    for (let i = 0; i < 3; i += 1) {
+      res = await signedFetch(poster, "POST", "/tasks/post", {
+        task_type: "execution",
+        instruction: `task-${i}`,
+        bounty_lamports: 100_000,
+        deadline_seconds: 300,
+      });
+      expect(res.status).toBe(201);
+      taskIds.push((await json(res)).task_id);
+    }
+
+    res = await signedFetch(worker, "POST", `/tasks/${taskIds[0]}/claim`);
+    expect(res.status).toBe(200);
+    res = await signedFetch(worker, "POST", `/tasks/${taskIds[1]}/claim`);
+    expect(res.status).toBe(200);
+    res = await signedFetch(worker, "POST", `/tasks/${taskIds[2]}/claim`);
+    expect(res.status).toBe(429);
+    const payload = await json(res);
+    expect(payload.error).toContain("Concurrent claim limit reached");
+
+    process.env.MAX_CONCURRENT_TASK_CLAIMS = "3";
   });
 
   it("returns 404 for nonexistent content and task", async () => {

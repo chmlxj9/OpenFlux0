@@ -14,7 +14,10 @@ const app = new Hono();
 
 // Global middleware
 app.use("*", logger());
-app.use("/content/publish", bodyLimit({ maxSize: config.maxBodyBytes }));
+app.use("/agents/*", bodyLimit({ maxSize: config.maxBodyBytes }));
+app.use("/content/*", bodyLimit({ maxSize: config.maxBodyBytes }));
+app.use("/author/*", bodyLimit({ maxSize: config.maxBodyBytes }));
+app.use("/tasks/*", bodyLimit({ maxSize: config.maxBodyBytes }));
 
 // Global error handler
 app.onError((err, c) => {

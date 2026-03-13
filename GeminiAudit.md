@@ -1,48 +1,92 @@
-# OpenFlux0 Code Audit (Final GO/NO-GO Review)
+# OpenFlux0 Code Audit (Post-Remediation Review)
 
 ## Executive Summary
-`OpenFlux0` is a security-oriented prototype for an agent-native content and task marketplace. Following recent mitigations, the critical transaction boundaries and ledger integrity issues have been resolved.
 
-However, the final deep-dive audit has uncovered several unmitigated vectors for **Denial of Service (DoS)** and **Business Logic Griefing** that render the current state vulnerable to trivial exploits. 
+`OpenFlux0` previously had several valid denial-of-service and business-logic concerns around unbounded request bodies, task-claim griefing, anchor verification lookups, and FTS query error handling.
 
-**VERDICT: NO-GO** (Conditional on mitigating the OOM and Griefing vulnerabilities)
+Those findings have now been implemented and verified in the current working tree.
 
----
+**Current verdict:** previous NO-GO blockers from the final Gemini review are resolved in this repo revision.
 
-## 🚨 Critical / High Severity Findings
+## Resolved Findings
 
-### 1. Missing Global Body Limits (OOM / Application DoS)
-**Location:** `src/index.ts`
-**Issue:** The `bodyLimit({ maxSize: config.maxBodyBytes })` middleware is strictly applied to the `/content/publish` route. However, other data-ingesting endpoints—most notably `POST /tasks/:taskId/submit`, `POST /content/:cuid/deliver_key`, and `POST /tasks/post`—call `await c.req.json()` without any prior size restriction.
-**Impact:** An attacker can send an arbitrarily large JSON payload (e.g., a 1GB string in the `proof` field) to these endpoints. Hono/Bun will attempt to buffer and parse the entire payload in memory, resulting in an Out-Of-Memory (OOM) crash that takes down the entire node.
-**Remediation:** Apply `bodyLimit` globally to all routes, or at minimum to all `POST` routes.
+### 1. Missing body limits on non-publish POST routes
 
-### 2. Task Claim Starvation (Business Logic Griefing)
-**Location:** `src/routes/tasks.ts` -> `app.post("/:taskId/claim")`
-**Issue:** There are no limits on how many concurrent tasks an agent can claim, nor is there a financial stake required to claim a task.
-**Impact:** A malicious user can write a simple script to register a free agent and automatically claim every open task on the platform as soon as it appears. Because they never submit a result, the tasks remain locked until their deadlines expire. This completely starves legitimate workers and renders the task marketplace permanently unusable.
-**Remediation:** Implement a `max_concurrent_claims` limit per agent, or require the claimer to temporarily lock a small stake/deposit that is slashed if they fail to submit before the deadline.
+**Previous state**
 
----
+- Only `/content/publish` had `bodyLimit(...)`.
+- Other JSON-ingesting routes could parse unbounded payloads in memory.
 
-## ⚠️ Medium & Low Severity Findings
+**Resolution**
 
-### 3. O(N) Hash Anchor Verification (CPU Exhaustion)
-**Location:** `src/routes/content.ts` -> `app.get("/:cuid/verify")`
-**Issue:** The query to verify an anchor uses `JOIN json_each(ha.cuid_list) je ON je.value = ?`. Because there is no index on the contents of the JSON arrays, SQLite must instantiate a virtual table and parse the JSON string for *every* row in the `hash_anchors` table until a match is found. 
-**Impact:** As the platform operates over time and accumulates thousands of anchor batches, this endpoint will require a full table scan and massive JSON deserialization overhead. Spamming this endpoint with non-existent CUIDs will artificially spike the node's CPU.
-**Remediation:** In future versions (e.g., M1/M2), normalize the anchor relationships by creating a linking table (`anchor_items`) mapping `anchor_id` directly to `cuid`.
+- Body-size middleware now applies across authenticated route groups in `src/index.ts`.
+- This covers `/agents/*`, `/content/*`, `/author/*`, and `/tasks/*`.
 
-### 4. Unhandled FTS5 Query Syntax Errors
-**Location:** `src/routes/content.ts` -> `app.get("/query")`
-**Issue:** The search parameter `q` is passed directly into the SQLite `fts5` engine via `MATCH ?`. The `fts5` query parser has strict syntax rules (e.g., requiring balanced quotes). If a user searches for a string like `"`, the database driver throws a syntax error, resulting in an unhandled 500 Internal Server Error.
-**Impact:** Minor usability issue and log noise.
-**Remediation:** Sanitize the search input to strip or escape FTS5 control characters, or wrap the query execution in a try/catch block that returns a 400 Bad Request.
+**Verification**
 
----
+- Added regression coverage for oversized `/tasks/post` payloads.
+- Existing `/content/publish` 413 coverage still passes.
 
-## 🛡️ Architecture & Security Strengths
-Despite the findings above, the core cryptographic and economic mechanics remain robust:
-- **Strong Cryptographic Boundaries:** The isolation between Ed25519 (for SolSign authentication) and NaCl x25519 (for sealed box key delivery) remains highly secure.
-- **x402 Integration:** The integration correctly relies on cryptographically verifiable off-chain state.
-- **Ledger Atomicity:** The previously discovered transaction stranding bugs have been successfully fixed and tested.
+### 2. Task claim starvation / griefing
+
+**Previous state**
+
+- A claimer could hold arbitrary numbers of tasks without any concurrency cap.
+
+**Resolution**
+
+- Added `MAX_CONCURRENT_TASK_CLAIMS` configuration in `src/config.ts`.
+- `POST /tasks/:taskId/claim` now rejects claims once the agent reaches the configured active-claim limit.
+
+**Verification**
+
+- Added a regression test showing the third concurrent claim is rejected when the limit is set to `2`.
+
+### 3. O(N) anchor verification lookup
+
+**Previous state**
+
+- Anchor membership lookups depended on `json_each(hash_anchors.cuid_list)`.
+- That required repeated JSON expansion for verification and anchor selection logic.
+
+**Resolution**
+
+- Added normalized `anchor_items(anchor_id, cuid)` via migration.
+- `src/routes/content.ts` now resolves anchor membership through `anchor_items`.
+- `src/anchor.ts` now uses `anchor_items` when deciding which content still needs anchoring.
+
+**Verification**
+
+- Existing anchor verification tests continue to pass after the schema change.
+- The migration backfills valid historical anchor memberships from `hash_anchors.cuid_list`.
+
+### 4. Unhandled FTS5 syntax errors
+
+**Previous state**
+
+- Invalid FTS expressions could bubble up as SQLite driver errors.
+
+**Resolution**
+
+- `GET /content/query` now catches FTS execution failures and returns `400 Invalid full-text search query` instead of a generic `500`.
+
+**Verification**
+
+- Added regression coverage for the invalid query `q=%22`.
+
+## Existing Notes
+
+### Daily spend window remains rolling, not calendar-based
+
+- `resetDailyIfNeeded()` still uses a rolling 24-hour window.
+- This is a UX issue, not a newly introduced correctness issue.
+
+### Single-node architecture remains a product constraint
+
+- The system still centers on a single embedded SQLite node.
+- That is an architectural limitation, but not an unmitigated bug in the current v0 scope.
+
+## Verification Summary
+
+- `bun test` passes on the current tree.
+- Current result: `56 pass`, `0 fail`.

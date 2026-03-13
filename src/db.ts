@@ -28,6 +28,7 @@ function runMigrations(database: Database) {
     "003_x402.sql",
     "004_fix_x402_indexes.sql",
     "005_task_expiry_index.sql",
+    "006_anchor_items.sql",
   ];
 
   for (const file of files) {

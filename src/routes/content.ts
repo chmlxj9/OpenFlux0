@@ -204,7 +204,15 @@ app.get("/query", (c) => {
   sql += ` ORDER BY ${orderMap[sort]} LIMIT ? OFFSET ?`;
   bindings.push(limit, offset);
 
-  const rows = db.query(sql).all(...bindings) as any[];
+  let rows: any[];
+  try {
+    rows = db.query(sql).all(...bindings) as any[];
+  } catch (e: any) {
+    if (q) {
+      return c.json({ error: "Invalid full-text search query" }, 400);
+    }
+    throw e;
+  }
 
   const results: ContentMeta[] = rows.map((r) => ({
     cuid: r.cuid,
@@ -324,9 +332,10 @@ app.get("/:cuid/verify", (c) => {
   const anchor = db
     .query(`
       SELECT ha.merkle_root, ha.tx_signature, ha.anchored_at, ha.cuid_list
-      FROM hash_anchors ha
-      JOIN json_each(ha.cuid_list) je ON je.value = ?
-      WHERE COALESCE(ha.tx_signature, '') <> ''
+      FROM anchor_items ai
+      JOIN hash_anchors ha ON ha.id = ai.anchor_id
+      WHERE ai.cuid = ?
+        AND COALESCE(ha.tx_signature, '') <> ''
       ORDER BY ha.created_at DESC
       LIMIT 1
     `)
