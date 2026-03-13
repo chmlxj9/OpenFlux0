@@ -1,51 +1,98 @@
+import type { Database } from "bun:sqlite";
 import { getDb } from "./db";
+
+function requireAgent(db: Database, pubkey: string) {
+  const agent = db
+    .query("SELECT balance FROM agents WHERE pubkey = ?")
+    .get(pubkey) as { balance: number } | null;
+
+  if (!agent) throw new Error("Agent not found");
+  return agent;
+}
+
+export function creditWithDb(
+  db: Database,
+  pubkey: string,
+  amount: number,
+  reason: string,
+  refId?: string
+) {
+  requireAgent(db, pubkey);
+  db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(amount, pubkey);
+  db.query(
+    "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
+  ).run(pubkey, amount, reason, refId ?? null);
+}
 
 export function credit(pubkey: string, amount: number, reason: string, refId?: string) {
   const db = getDb();
   db.transaction(() => {
-    db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(amount, pubkey);
-    db.query(
-      "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-    ).run(pubkey, amount, reason, refId ?? null);
+    creditWithDb(db, pubkey, amount, reason, refId);
   })();
+}
+
+export function debitWithDb(
+  db: Database,
+  pubkey: string,
+  amount: number,
+  reason: string,
+  refId?: string
+) {
+  const agent = requireAgent(db, pubkey);
+  if (agent.balance < amount) throw new Error("Insufficient balance");
+
+  // Check daily spending cap
+  resetDailyIfNeeded(db, pubkey);
+  const policy = db
+    .query("SELECT daily_spend_cap FROM principal_policies WHERE pubkey = ?")
+    .get(pubkey) as { daily_spend_cap: number } | null;
+
+  if (policy) {
+    const agentRow = db
+      .query("SELECT daily_spent FROM agents WHERE pubkey = ?")
+      .get(pubkey) as { daily_spent: number };
+    if (agentRow.daily_spent + amount > policy.daily_spend_cap) {
+      throw new Error("Daily spending cap exceeded");
+    }
+  }
+
+  db.query("UPDATE agents SET balance = balance - ?, daily_spent = daily_spent + ? WHERE pubkey = ?")
+    .run(amount, amount, pubkey);
+  db.query(
+    "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
+  ).run(pubkey, -amount, reason, refId ?? null);
 }
 
 export function debit(pubkey: string, amount: number, reason: string, refId?: string) {
   const db = getDb();
   db.transaction(() => {
-    const agent = db
-      .query("SELECT balance FROM agents WHERE pubkey = ?")
-      .get(pubkey) as { balance: number } | null;
-
-    if (!agent) throw new Error("Agent not found");
-    if (agent.balance < amount) throw new Error("Insufficient balance");
-
-    // Check daily spending cap
-    resetDailyIfNeeded(pubkey);
-    const policy = db
-      .query("SELECT daily_spend_cap FROM principal_policies WHERE pubkey = ?")
-      .get(pubkey) as { daily_spend_cap: number } | null;
-
-    if (policy) {
-      const agentRow = db
-        .query("SELECT daily_spent FROM agents WHERE pubkey = ?")
-        .get(pubkey) as { daily_spent: number };
-      if (agentRow.daily_spent + amount > policy.daily_spend_cap) {
-        throw new Error("Daily spending cap exceeded");
-      }
-    }
-
-    db.query("UPDATE agents SET balance = balance - ?, daily_spent = daily_spent + ? WHERE pubkey = ?")
-      .run(amount, amount, pubkey);
-    db.query(
-      "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-    ).run(pubkey, -amount, reason, refId ?? null);
+    debitWithDb(db, pubkey, amount, reason, refId);
   })();
+}
+
+export function holdWithDb(
+  db: Database,
+  pubkey: string,
+  amount: number,
+  reason: string,
+  refId?: string
+) {
+  debitWithDb(db, pubkey, amount, reason, refId);
 }
 
 export function hold(pubkey: string, amount: number, reason: string, refId?: string) {
   // Hold is the same as debit — funds removed from available balance
   debit(pubkey, amount, reason, refId);
+}
+
+export function releaseWithDb(
+  db: Database,
+  pubkey: string,
+  amount: number,
+  reason: string,
+  refId?: string
+) {
+  creditWithDb(db, pubkey, amount, reason, refId);
 }
 
 export function release(pubkey: string, amount: number, reason: string, refId?: string) {
@@ -61,8 +108,7 @@ export function getBalance(pubkey: string): number {
   return row?.balance ?? 0;
 }
 
-function resetDailyIfNeeded(pubkey: string) {
-  const db = getDb();
+function resetDailyIfNeeded(db: Database, pubkey: string) {
   const agent = db
     .query("SELECT daily_reset_at FROM agents WHERE pubkey = ?")
     .get(pubkey) as { daily_reset_at: string } | null;

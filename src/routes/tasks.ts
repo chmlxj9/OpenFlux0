@@ -1,11 +1,19 @@
 import { Hono } from "hono";
 import { getDb } from "../db";
 import { PostTaskSchema, SubmitTaskSchema } from "../schema";
-import { hold, credit } from "../ledger";
+import { holdWithDb, creditWithDb } from "../ledger";
 import { newCuid } from "../utils/cuid";
 import { config } from "../config";
 
 const app = new Hono<{ Variables: { pubkey: string } }>();
+
+function operatorFeeAmount(db: ReturnType<typeof getDb>, fee: number) {
+  if (fee <= 0 || !config.nodeOperatorPubkey) return 0;
+  const operator = db
+    .query("SELECT 1 FROM agents WHERE pubkey = ?")
+    .get(config.nodeOperatorPubkey);
+  return operator ? fee : 0;
+}
 
 // POST /tasks/post — post a task with bounty
 app.post("/post", async (c) => {
@@ -18,28 +26,29 @@ app.post("/post", async (c) => {
 
   const data = parsed.data;
   const taskId = newCuid();
+  const db = getDb();
 
-  // Hold bounty from poster's balance
+  // Hold bounty from poster's balance and create the task atomically.
   try {
-    hold(pubkey, data.bounty_lamports, "task_bounty_hold", taskId);
+    db.transaction(() => {
+      holdWithDb(db, pubkey, data.bounty_lamports, "task_bounty_hold", taskId);
+      db.query(`
+        INSERT INTO tasks (task_id, poster_pubkey, task_type, instruction,
+          source_cuid, bounty_lamports, deadline_seconds)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        taskId,
+        pubkey,
+        data.task_type,
+        data.instruction,
+        data.source_cuid ?? null,
+        data.bounty_lamports,
+        data.deadline_seconds
+      );
+    })();
   } catch (e: any) {
     return c.json({ error: e.message }, 400);
   }
-
-  const db = getDb();
-  db.query(`
-    INSERT INTO tasks (task_id, poster_pubkey, task_type, instruction,
-      source_cuid, bounty_lamports, deadline_seconds)
-    VALUES (?, ?, ?, ?, ?, ?, ?)
-  `).run(
-    taskId,
-    pubkey,
-    data.task_type,
-    data.instruction,
-    data.source_cuid ?? null,
-    data.bounty_lamports,
-    data.deadline_seconds
-  );
 
   return c.json({ task_id: taskId, status: "open", bounty: data.bounty_lamports }, 201);
 });
@@ -47,9 +56,6 @@ app.post("/post", async (c) => {
 // GET /tasks/available — list open tasks
 app.get("/available", (c) => {
   const db = getDb();
-
-  // Expire overdue claimed tasks first
-  expireOverdueTasks();
 
   const taskType = c.req.query("task_type");
   let sql = `
@@ -89,11 +95,14 @@ app.post("/:taskId/claim", (c) => {
 
   const deadlineAt = new Date(Date.now() + deadlineRow.deadline_seconds * 1000).toISOString();
 
-  db.query(`
+  const updated = db.query(`
     UPDATE tasks SET status = 'claimed', claimer_pubkey = ?,
       claimed_at = datetime('now'), deadline_at = ?
-    WHERE task_id = ?
+    WHERE task_id = ? AND status = 'open'
   `).run(pubkey, deadlineAt, taskId);
+  if (!updated.changes) {
+    return c.json({ error: "Task is no longer open" }, 409);
+  }
 
   return c.json({ task_id: taskId, status: "claimed", deadline_at: deadlineAt });
 });
@@ -135,21 +144,32 @@ app.post("/:taskId/submit", async (c) => {
 
   // Auto-settle: pay claimer, deduct fee
   const bounty = task.bounty_lamports;
-  const fee = Math.floor((bounty * config.nodeTaskFeeBps) / 10000);
-  const claimerPayout = bounty - fee;
+  const requestedFee = Math.floor((bounty * config.nodeTaskFeeBps) / 10000);
+  let fee = 0;
+  let claimerPayout = bounty;
 
-  db.transaction(() => {
-    db.query(`
-      UPDATE tasks SET status = 'completed', result = ?, proof = ?, settled_at = datetime('now')
-      WHERE task_id = ?
-    `).run(parsed.data.result, parsed.data.proof ?? null, taskId);
+  try {
+    db.transaction(() => {
+      fee = operatorFeeAmount(db, requestedFee);
+      claimerPayout = bounty - fee;
 
-    // Pay claimer (bounty was already held from poster)
-    credit(pubkey, claimerPayout, "task_payout", taskId);
-    if (fee > 0 && config.nodeOperatorPubkey) {
-      credit(config.nodeOperatorPubkey, fee, "task_fee", taskId);
-    }
-  })();
+      const updated = db.query(`
+        UPDATE tasks SET status = 'completed', result = ?, proof = ?, settled_at = datetime('now')
+        WHERE task_id = ? AND status = 'claimed'
+      `).run(parsed.data.result, parsed.data.proof ?? null, taskId);
+      if (!updated.changes) {
+        throw new Error("Task is no longer claimable");
+      }
+
+      // Pay claimer (bounty was already held from poster)
+      creditWithDb(db, pubkey, claimerPayout, "task_payout", taskId);
+      if (fee > 0 && config.nodeOperatorPubkey) {
+        creditWithDb(db, config.nodeOperatorPubkey, fee, "task_fee", taskId);
+      }
+    })();
+  } catch (e: any) {
+    return c.json({ error: e.message ?? "Failed to settle task" }, 409);
+  }
 
   return c.json({
     task_id: taskId,
@@ -170,21 +190,37 @@ app.get("/:taskId", (c) => {
 
 // -- Helpers --
 
-function expireOverdueTasks() {
+export function expireOverdueTasks(limit = config.taskExpiryBatchSize) {
   const db = getDb();
+  const nowIso = new Date().toISOString();
   const overdue = db
     .query(`
-      SELECT task_id
+      SELECT task_id, poster_pubkey, bounty_lamports
       FROM tasks
       WHERE status = 'claimed'
         AND deadline_at IS NOT NULL
-        AND julianday(deadline_at) < julianday('now')
+        AND deadline_at < ?
+      ORDER BY deadline_at ASC
+      LIMIT ?
     `)
-    .all() as { task_id: string }[];
+    .all(nowIso, limit) as { task_id: string; poster_pubkey: string; bounty_lamports: number }[];
 
-  for (const { task_id } of overdue) {
-    expireTask(task_id);
-  }
+  if (overdue.length === 0) return 0;
+
+  let expiredCount = 0;
+  db.transaction(() => {
+    for (const task of overdue) {
+      const updated = db
+        .query("UPDATE tasks SET status = 'expired' WHERE task_id = ? AND status = 'claimed'")
+        .run(task.task_id);
+      if (!updated.changes) continue;
+
+      creditWithDb(db, task.poster_pubkey, task.bounty_lamports, "task_bounty_refund", task.task_id);
+      expiredCount += 1;
+    }
+  })();
+
+  return expiredCount;
 }
 
 function expireTask(taskId: string) {
@@ -196,9 +232,12 @@ function expireTask(taskId: string) {
   if (!task || task.status === "expired" || task.status === "completed") return;
 
   db.transaction(() => {
-    db.query("UPDATE tasks SET status = 'expired' WHERE task_id = ?").run(taskId);
+    const updated = db
+      .query("UPDATE tasks SET status = 'expired' WHERE task_id = ? AND status = 'claimed'")
+      .run(taskId);
+    if (!updated.changes) return;
     // Return bounty to poster
-    credit(task.poster_pubkey, task.bounty_lamports, "task_bounty_refund", taskId);
+    creditWithDb(db, task.poster_pubkey, task.bounty_lamports, "task_bounty_refund", taskId);
   })();
 }
 

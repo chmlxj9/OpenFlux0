@@ -15,6 +15,8 @@ mkdirSync(dataDir, { recursive: true });
 
 process.env.DATA_DIR = dataDir;
 process.env.ANCHOR_INTERVAL_MS = "0";
+process.env.AUTH_NONCE_PRUNE_INTERVAL_MS = "0";
+process.env.TASK_EXPIRY_INTERVAL_MS = "0";
 process.env.ANCHOR_MIN_ITEMS = "1";
 process.env.NODE_OPERATOR_PUBKEY = "";
 process.env.X402_ENABLED = "false";
@@ -22,6 +24,7 @@ process.env.X402_PAY_TO = "";
 
 const { default: server } = await import("../src/index");
 const { getDb, closeDb } = await import("../src/db");
+const { expireOverdueTasks } = await import("../src/routes/tasks");
 const { anchorHashes, buildMerkleRoot, verifyMerkleProof } = await import(
   "../src/anchor"
 );
@@ -634,7 +637,7 @@ describe("OpenFlux scenario validation", () => {
     expect(res.status).toBe(403);
   });
 
-  it("expires overdue claimed tasks during /tasks/available and refunds poster", async () => {
+  it("expires overdue claimed tasks in the background worker and refunds poster", async () => {
     const alice = new Agent();
     const bob = new Agent();
 
@@ -663,8 +666,8 @@ describe("OpenFlux scenario validation", () => {
       task_id
     );
 
-    res = await signedFetch(bob, "GET", "/tasks/available");
-    expect(res.status).toBe(200);
+    const expired = expireOverdueTasks();
+    expect(expired).toBe(1);
 
     const task = db
       .query("SELECT status FROM tasks WHERE task_id = ?")
@@ -969,6 +972,35 @@ describe("OpenFlux scenario validation", () => {
     expect(body.error).toContain("Insufficient balance");
   });
 
+  it("rolls back bounty hold when task creation fails", async () => {
+    const alice = new Agent();
+    let res = await signedFetch(alice, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+
+    res = await signedFetch(alice, "POST", "/agents/deposit", { amount: 500_000 });
+    expect(res.status).toBe(200);
+
+    res = await signedFetch(alice, "POST", "/tasks/post", {
+      task_type: "execution",
+      instruction: "do thing",
+      source_cuid: "nonexistent-cuid",
+      bounty_lamports: 100_000,
+      deadline_seconds: 60,
+    });
+    expect(res.status).toBe(400);
+
+    const db = getDb();
+    const agent = db
+      .query("SELECT balance FROM agents WHERE pubkey = ?")
+      .get(alice.pubkey) as { balance: number };
+    expect(agent.balance).toBe(500_000);
+
+    const taskHolds = db
+      .query("SELECT COUNT(*) as cnt FROM ledger WHERE pubkey = ? AND reason = 'task_bounty_hold'")
+      .get(alice.pubkey) as { cnt: number };
+    expect(taskHolds.cnt).toBe(0);
+  });
+
   it("rejects claiming an already-claimed task", async () => {
     const alice = new Agent();
     const bob = new Agent();
@@ -1164,6 +1196,53 @@ describe("OpenFlux scenario validation", () => {
       .query("SELECT balance FROM agents WHERE pubkey = ?")
       .get(operator.pubkey) as { balance: number };
     expect(operatorBalance.balance).toBe(1000);
+
+    process.env.NODE_OPERATOR_PUBKEY = "";
+  });
+
+  it("settles tasks even when the configured operator account is not registered", async () => {
+    const alice = new Agent();
+    const bob = new Agent();
+
+    process.env.NODE_OPERATOR_PUBKEY = "ab".repeat(32);
+
+    let res = await signedFetch(alice, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+    res = await signedFetch(bob, "POST", "/agents/register");
+    expect(res.status).toBe(201);
+    res = await signedFetch(alice, "POST", "/agents/deposit", { amount: 500_000 });
+    expect(res.status).toBe(200);
+
+    res = await signedFetch(alice, "POST", "/tasks/post", {
+      task_type: "execution",
+      instruction: "do thing",
+      bounty_lamports: 100_000,
+      deadline_seconds: 300,
+    });
+    expect(res.status).toBe(201);
+    const { task_id } = await json(res);
+
+    res = await signedFetch(bob, "POST", `/tasks/${task_id}/claim`);
+    expect(res.status).toBe(200);
+
+    res = await signedFetch(bob, "POST", `/tasks/${task_id}/submit`, {
+      result: "done",
+    });
+    expect(res.status).toBe(200);
+    const payload = await json(res);
+    expect(payload.fee).toBe(0);
+    expect(payload.payout).toBe(100_000);
+
+    const db = getDb();
+    const task = db
+      .query("SELECT status FROM tasks WHERE task_id = ?")
+      .get(task_id) as { status: string };
+    expect(task.status).toBe("completed");
+
+    const bobBalance = db
+      .query("SELECT balance FROM agents WHERE pubkey = ?")
+      .get(bob.pubkey) as { balance: number };
+    expect(bobBalance.balance).toBe(100_000);
 
     process.env.NODE_OPERATOR_PUBKEY = "";
   });

@@ -4,11 +4,11 @@ import { bodyLimit } from "hono/body-limit";
 import { HTTPException } from "hono/http-exception";
 import { getDb, closeDb } from "./db";
 import { config } from "./config";
-import { authMiddleware } from "./auth";
+import { authMiddleware, pruneExpiredAuthNonces } from "./auth";
 import { anchorHashes } from "./anchor";
 import agentRoutes from "./routes/agents";
 import contentRoutes, { authorRoutes } from "./routes/content";
-import taskRoutes from "./routes/tasks";
+import taskRoutes, { expireOverdueTasks } from "./routes/tasks";
 
 const app = new Hono();
 
@@ -73,6 +73,8 @@ console.log(`[openflux] Database initialized at ${config.dataDir}/openflux.db`);
 
 // Hash anchoring timer
 let anchorTimer: ReturnType<typeof setInterval> | null = null;
+let noncePruneTimer: ReturnType<typeof setInterval> | null = null;
+let taskExpiryTimer: ReturnType<typeof setInterval> | null = null;
 if (config.anchorIntervalMs > 0) {
   anchorTimer = setInterval(async () => {
     try {
@@ -88,10 +90,38 @@ if (config.anchorIntervalMs > 0) {
   }, config.anchorIntervalMs);
 }
 
+if (config.authNoncePruneIntervalMs > 0) {
+  noncePruneTimer = setInterval(() => {
+    try {
+      const removed = pruneExpiredAuthNonces();
+      if (removed > 0) {
+        console.log(`[auth] Pruned ${removed} expired auth nonces`);
+      }
+    } catch (e) {
+      console.error("[auth] Nonce prune error:", e);
+    }
+  }, config.authNoncePruneIntervalMs);
+}
+
+if (config.taskExpiryIntervalMs > 0) {
+  taskExpiryTimer = setInterval(() => {
+    try {
+      const expired = expireOverdueTasks();
+      if (expired > 0) {
+        console.log(`[tasks] Expired ${expired} overdue task(s)`);
+      }
+    } catch (e) {
+      console.error("[tasks] Expiry worker error:", e);
+    }
+  }, config.taskExpiryIntervalMs);
+}
+
 // Graceful shutdown
 process.on("SIGINT", () => {
   console.log("\n[openflux] Shutting down…");
   if (anchorTimer) clearInterval(anchorTimer);
+  if (noncePruneTimer) clearInterval(noncePruneTimer);
+  if (taskExpiryTimer) clearInterval(taskExpiryTimer);
   closeDb();
   process.exit(0);
 });

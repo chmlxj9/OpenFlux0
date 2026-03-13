@@ -34,6 +34,15 @@ export const config = {
   get anchorMinItems() {
     return Number(process.env.ANCHOR_MIN_ITEMS ?? 5);
   },
+  get authNoncePruneIntervalMs() {
+    return Number(process.env.AUTH_NONCE_PRUNE_INTERVAL_MS ?? 60_000);
+  },
+  get taskExpiryIntervalMs() {
+    return Number(process.env.TASK_EXPIRY_INTERVAL_MS ?? 30_000);
+  },
+  get taskExpiryBatchSize() {
+    return Number(process.env.TASK_EXPIRY_BATCH_SIZE ?? 100);
+  },
 
   get maxPublishesPerDay() {
     return Number(process.env.MAX_PUBLISHES_PER_DAY ?? 10);

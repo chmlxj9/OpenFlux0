@@ -13,6 +13,7 @@ import { buildMerkleProof } from "../anchor";
 import { newCuid } from "../utils/cuid";
 import { config } from "../config";
 import { usdcBaseToLamports } from "../pricing";
+import { creditWithDb, debitWithDb } from "../ledger";
 
 const app = new Hono<{ Variables: { pubkey: string } }>();
 
@@ -445,7 +446,12 @@ app.post("/:cuid/request_key", async (c) => {
               content.price_usdc != null && content.price_usdc > 0
                 ? usdcBaseToLamports(content.price_usdc)
                 : content.price_lamports;
-            const fee = Math.floor((price * config.nodeQueryFeeBps) / 10000);
+            const requestedFee = Math.floor((price * config.nodeQueryFeeBps) / 10000);
+            const operatorExists =
+              requestedFee > 0 &&
+              !!config.nodeOperatorPubkey &&
+              !!db.query("SELECT 1 FROM agents WHERE pubkey = ?").get(config.nodeOperatorPubkey);
+            const fee = operatorExists ? requestedFee : 0;
             const authorPayment = price - fee;
 
             // Buyer audit (no balance debit — payment was external USDC)
@@ -454,28 +460,11 @@ app.post("/:cuid/request_key", async (c) => {
             ).run(pubkey, -price, "content_purchase_x402", cuid);
 
             // Author credit
-            db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(
-              authorPayment,
-              content.author_pubkey
-            );
-            db.query(
-              "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-            ).run(content.author_pubkey, authorPayment, "content_sale_x402", cuid);
+            creditWithDb(db, content.author_pubkey, authorPayment, "content_sale_x402", cuid);
 
             // Node operator fee
             if (fee > 0 && config.nodeOperatorPubkey) {
-              const operator = db
-                .query("SELECT 1 FROM agents WHERE pubkey = ?")
-                .get(config.nodeOperatorPubkey);
-              if (operator) {
-                db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(
-                  fee,
-                  config.nodeOperatorPubkey
-                );
-                db.query(
-                  "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-                ).run(config.nodeOperatorPubkey, fee, "query_fee_x402", cuid);
-              }
+              creditWithDb(db, config.nodeOperatorPubkey, fee, "query_fee_x402", cuid);
             }
           }
         } else {
@@ -487,65 +476,28 @@ app.post("/:cuid/request_key", async (c) => {
             .get(pubkey, cuid);
 
           if (!paid) {
-            const buyer = db
-              .query("SELECT balance, daily_spent, daily_reset_at FROM agents WHERE pubkey = ?")
-              .get(pubkey) as {
-              balance: number;
-              daily_spent: number;
-              daily_reset_at: string;
-            } | null;
-            if (!buyer) throw new RouteError(404, "Agent not registered");
-
-            let dailySpent = buyer.daily_spent;
-            const resetAt = new Date(`${buyer.daily_reset_at}Z`);
-            if (!Number.isNaN(resetAt.getTime()) && Date.now() - resetAt.getTime() > 24 * 60 * 60 * 1000) {
-              dailySpent = 0;
-              db.query(
-                "UPDATE agents SET daily_spent = 0, daily_reset_at = datetime('now') WHERE pubkey = ?"
-              ).run(pubkey);
-            }
-
             const price = content.price_lamports;
-            if (buyer.balance < price) throw new RouteError(400, "Insufficient balance");
-
-            const policy = db
-              .query("SELECT daily_spend_cap FROM principal_policies WHERE pubkey = ?")
-              .get(pubkey) as { daily_spend_cap: number } | null;
-            if (policy && dailySpent + price > policy.daily_spend_cap) {
-              throw new RouteError(400, "Daily spending cap exceeded");
-            }
-
-            const fee = Math.floor((price * config.nodeQueryFeeBps) / 10000);
+            const requestedFee = Math.floor((price * config.nodeQueryFeeBps) / 10000);
+            const operatorExists =
+              requestedFee > 0 &&
+              !!config.nodeOperatorPubkey &&
+              !!db.query("SELECT 1 FROM agents WHERE pubkey = ?").get(config.nodeOperatorPubkey);
+            const fee = operatorExists ? requestedFee : 0;
             const authorPayment = price - fee;
 
-            db.query(
-              "UPDATE agents SET balance = balance - ?, daily_spent = ? WHERE pubkey = ?"
-            ).run(price, dailySpent + price, pubkey);
-            db.query(
-              "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-            ).run(pubkey, -price, "content_purchase", cuid);
+            try {
+              debitWithDb(db, pubkey, price, "content_purchase", cuid);
+            } catch (e: any) {
+              throw new RouteError(
+                e.message === "Agent not found" ? 404 : 400,
+                e.message ?? "Failed to debit buyer"
+              );
+            }
 
-            db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(
-              authorPayment,
-              content.author_pubkey
-            );
-            db.query(
-              "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-            ).run(content.author_pubkey, authorPayment, "content_sale", cuid);
+            creditWithDb(db, content.author_pubkey, authorPayment, "content_sale", cuid);
 
             if (fee > 0 && config.nodeOperatorPubkey) {
-              const operator = db
-                .query("SELECT 1 FROM agents WHERE pubkey = ?")
-                .get(config.nodeOperatorPubkey);
-              if (operator) {
-                db.query("UPDATE agents SET balance = balance + ? WHERE pubkey = ?").run(
-                  fee,
-                  config.nodeOperatorPubkey
-                );
-                db.query(
-                  "INSERT INTO ledger (pubkey, amount, reason, ref_id) VALUES (?, ?, ?, ?)"
-                ).run(config.nodeOperatorPubkey, fee, "query_fee", cuid);
-              }
+              creditWithDb(db, config.nodeOperatorPubkey, fee, "query_fee", cuid);
             }
           }
         }

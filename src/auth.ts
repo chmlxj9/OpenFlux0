@@ -1,3 +1,4 @@
+import type { Database } from "bun:sqlite";
 import type { Context, Next } from "hono";
 import { getDb } from "./db";
 import { verifySignature, fromHex } from "./crypto";
@@ -8,6 +9,13 @@ const NONCE_RETENTION_SECONDS = 10 * 60;
 export type AuthContext = {
   pubkey: string;
 };
+
+export function pruneExpiredAuthNonces(db: Database = getDb()) {
+  const result = db
+    .query("DELETE FROM auth_nonces WHERE used_at < datetime('now', ?)")
+    .run(`-${NONCE_RETENTION_SECONDS} seconds`);
+  return Number(result.changes ?? 0);
+}
 
 /**
  * Auth middleware: verifies SolSign header.
@@ -65,11 +73,7 @@ export async function authMiddleware(c: Context, next: Next) {
   }
 
   // Replay defense: reject reused nonce for same pubkey.
-  // Old rows are pruned opportunistically.
   const db = getDb();
-  db.query(
-    "DELETE FROM auth_nonces WHERE used_at < datetime('now', ?)"
-  ).run(`-${NONCE_RETENTION_SECONDS} seconds`);
   try {
     db.query("INSERT INTO auth_nonces (pubkey, nonce) VALUES (?, ?)").run(
       pubkeyHex,

@@ -22,7 +22,13 @@ function runMigrations(database: Database) {
   );
 
   const migrationDir = resolve(import.meta.dir, "../migrations");
-  const files = ["001_init.sql", "002_hardening.sql", "003_x402.sql", "004_fix_x402_indexes.sql"];
+  const files = [
+    "001_init.sql",
+    "002_hardening.sql",
+    "003_x402.sql",
+    "004_fix_x402_indexes.sql",
+    "005_task_expiry_index.sql",
+  ];
 
   for (const file of files) {
     const applied = database

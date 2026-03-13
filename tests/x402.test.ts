@@ -19,6 +19,8 @@ mkdirSync(dataDir, { recursive: true });
 // Enable x402 mode BEFORE importing server
 process.env.DATA_DIR = dataDir;
 process.env.ANCHOR_INTERVAL_MS = "0";
+process.env.AUTH_NONCE_PRUNE_INTERVAL_MS = "0";
+process.env.TASK_EXPIRY_INTERVAL_MS = "0";
 process.env.PORT = "3098";
 process.env.X402_ENABLED = "true";
 process.env.X402_PAY_TO = "EiGrpvErat2fQLFdx2W9GKUCGRdrQfdv1jtqBN2rCjYU";
