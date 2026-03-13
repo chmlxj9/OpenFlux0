@@ -5,3 +5,6 @@ data/*.db-*
 dist/
 *.tsbuildinfo
 tests/tmp-*
+*.log
+payload_oom.json
+test_*.ts
