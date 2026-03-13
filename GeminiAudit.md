@@ -52,4 +52,4 @@ The following major issues have been correctly mitigated:
 
 ## Final Verification
 - All functional test suites (`bun test`) execute successfully.
-- 53/53 tests pass, verifying the functional correctness of the mitigations (note: tests explicitly disable the background maintenance timers, so those paths are tested functionally but not under concurrent execution).
+- 53/53 tests pass. These tests verify the functional correctness of the task-expiry logic via direct calls to `expireOverdueTasks()`. Note, however, that test coverage is incomplete: there is no direct test coverage for the auth nonce pruning logic (`pruneExpiredAuthNonces()`), and the tests explicitly disable the background maintenance timers, meaning the actual timer wiring and concurrent execution under load remain untested.
